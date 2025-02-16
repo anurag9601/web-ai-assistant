@@ -2,11 +2,9 @@ import axios, { all } from "axios";
 import * as cheerio from 'cheerio';
 import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { ChromaClient } from "chromadb";
-import Groq from "groq-sdk";
+import { ChromaClient, Metadata } from "chromadb";
 import readline from "node:readline";
 import { stdin, stdout } from "node:process";
-import { link } from "node:fs";
 
 dotenv.config();
 
@@ -14,171 +12,199 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY as string);
 
 const model = genAI.getGenerativeModel({ model: "text-embedding-004" });
 
-const chromaClient = new ChromaClient({ path: "http://localhost:8000" });
+const chatModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
+let allLinks: string[] | null = null;
+
+const chromaClient = new ChromaClient({ path: "http://localhost:8000" });
 chromaClient.heartbeat();
 
-const WEB_COLLECTION = "WEB_SCRAPED_DATA_COLLECTION-1";
+const WEB_COLLECTION = 'WEB_COLLECTION_1';
 
-const visitedUrls = new Set<string>();
+const rl = readline.createInterface({ input: stdin, output: stdout });
 
-const gorq = new Groq({ apiKey: process.env.GROQ_API_KEY as string });
-
-async function webScrappingOfSite(url: string = "") {
+async function webScrappingOfPage(url: string = "") {
     try {
         const { data } = await axios.get(url);
+
         const $ = cheerio.load(data);
 
         const head = $("head").html();
         const body = $("body").html();
+        let internalLinks = new Set<string>();
+        let externalLinks = new Set<string>();
 
-        let pageLinks = new Set<string>();
+        const links = $("a")
 
-        $("a").each((_, el) => {
+        links.each((_, el) => {
             const href = $(el).attr("href");
-            if (!href || href == "/") return;
+            if (href === "/" || !href) return;
 
-            const resolvedUrl = new URL(href, url).href;
+            const resolvedURL = new URL(href, url).href;
 
-            if (resolvedUrl.startsWith("http://") || resolvedUrl.startsWith("https://")) {
-                pageLinks.add(resolvedUrl)
+            if (resolvedURL.startsWith(url)) {
+                internalLinks.add(resolvedURL);
+            } else {
+                externalLinks.add(resolvedURL);
             }
         });
 
-        return { head, body, pageLinks: Array.from(pageLinks) }
-    } catch (err) {
-        console.error("Error scraping URL:", url, err);
-        return { head: null, body: null, pageLinks: [] };
-    }
-};
-
-function chunkText(text: string, maxBytes: number) {
-    if (!text) return [];
-
-    let chunks: string[] = [];
-    let currentChunk = "";
-    let currentSize = 0;
-
-    for (let word of text.split(/\s+/)) {
-        let wordSize = new TextEncoder().encode(word).length;
-
-        if (currentSize + wordSize > maxBytes) {
-            chunks.push(currentChunk.trim());
-            currentChunk = word;
-            currentSize = wordSize;
-        } else {
-            currentChunk += " " + word;
-            currentSize += wordSize;
+        if (!allLinks) {
+            allLinks = [...Array.from(internalLinks)]
         }
-    }
-    if (currentChunk) chunks.push(currentChunk.trim());
 
+        return { head, body }
+    } catch (err) {
+        console.log(`Something went wrong: ${err}`);
+        return { head: null, body: null }
+    }
+}
+
+function chunkText(text: string, chunkSize: number) {
+    if (!text || chunkSize <= 0) return [];
+
+    const chunks = [];
+    for (let i = 0; i < text.length; i += chunkSize) {
+        chunks.push(text.slice(i, i + chunkSize));
+    }
     return chunks;
 }
 
 
-async function generateVectorEmbeddings({ text }: { text: string }) {
-    const truncatedText = text.substring(0, 9500);
-    const result = await model.embedContent(truncatedText);
-    return result.embedding.values;
-}
+async function generateVectorEmbeddingsOfData({ text }: { text: string }) {
+    const encoder = new TextEncoder();
 
-async function insertIntoDB({ embedding, url, head, body = "" }: { embedding: number[], url: string, head: string, body: string }) {
-    const collection = await chromaClient.getOrCreateCollection({
-        name: WEB_COLLECTION
-    });
+    const byteLength = encoder.encode(text).length;
 
-    await collection.add({
-        ids: [url],
-        embeddings: [embedding],
-        metadatas: [{ url, head, body }]
-    });
-}
-
-async function ingest(url: string, depth = 0) {
-    if (visitedUrls.has(url)) return;
-
-    visitedUrls.add(url);
-
-    let { head, body, pageLinks } = await webScrappingOfSite(url);
-
-    if (!body || !head) return;
-
-    const Headchunks = chunkText(head, 100); // it has limit of 1000 bytes...
-    const BodyChunks = chunkText(body, 500);
-
-    for (let chunk of Headchunks) {
-        const headEmbedding = await generateVectorEmbeddings({ text: chunk });
-        await insertIntoDB({ embedding: headEmbedding, url, head, body });
+    if (byteLength > 10000) {
+        console.error(`Chunk exceeds byte limit: ${byteLength}`);
+        throw new Error("Chunk exceeds byte limit");
     }
 
 
-    for (let chunk of BodyChunks) {
-        const bodyEmbeddings = await generateVectorEmbeddings({
-            text: chunk
+    try {
+        const result = await model.embedContent(text);
+        return result.embedding.values;
+    } catch (error) {
+        console.error("Error embedding content:", error);
+        throw error;
+    }
+}
+
+
+async function insert(url: string = "") {
+    const { head, body } = await webScrappingOfPage(url);
+
+    if (!head || !body) return;
+
+    const headChunks = chunkText(head, 2500);
+    const bodyChunks = chunkText(body, 2500);
+
+    for (let chunk of headChunks) {
+        if (chunk.trim() === "") continue;
+
+        const headEmbeddings = await generateVectorEmbeddingsOfData({ text: chunk });
+
+        const collection = await chromaClient.getOrCreateCollection({
+            name: WEB_COLLECTION
         });
-        await insertIntoDB({ embedding: bodyEmbeddings, url, head, body });
+
+        await collection.add({
+            ids: [url],
+            embeddings: [headEmbeddings],
+            metadatas: [{ url, head, body }]
+        })
+    }
+
+    for (let chunk of bodyChunks) {
+        if (chunk.trim() === "") continue;
+
+        const bodyEmbeddings = await generateVectorEmbeddingsOfData({ text: chunk });
+
+        const collection = await chromaClient.getOrCreateCollection({
+            name: WEB_COLLECTION
+        });
+
+        await collection.add({
+            ids: [url],
+            embeddings: [bodyEmbeddings],
+            metadatas: [{ url, head, body }]
+        })
     }
 }
 
-async function chat(question: string) {
-    const questionEmbedding = await generateVectorEmbeddings({ text: question });
-
-    const collection = await chromaClient.getOrCreateCollection({
-        name: WEB_COLLECTION
-    });
-
-    const collectionResult = await collection.query({
-        nResults: 3,
-        queryEmbeddings: questionEmbedding
-    });
-
-    const body = collectionResult.metadatas[0].map((e: any) => e.body).filter((e) => e.trim() !== "" && !!e);
-
-    const head = collectionResult.metadatas[0].map((e: any) => e.head).filter((e) => e.trim() !== "" && !!e);
-
-    const url = collectionResult.metadatas[0].map((e: any) => e.url).filter((e) => e.trim() !== "" && !!e);
-
-    const chatCompletion = await gorq.chat.completions.create({
-        messages: [
-            {
-                role: "system",
-                content: "You are an AI support agent expert in providing support to users on behalf of a webpage. Given the context about page content, reply the user accordingly"
-            },
-            {
-                role: "user",
-                content: `
-                {
-                    Query: ${question},
-                    URLs: ${url},
-                    Retrived_Head_Context: ${head},
-                    Retrived_Body_Context: ${body},
-                }
-                `
-            }
-        ],
-        model: "llama-3.3-70b-versatile"
-    });
-
-    console.log({
-        message: `🤖: ${chatCompletion.choices[0]?.message.content}`,
-        url: url[0]
-    })
+async function startDataFeeding(url = "") {
+    await insert(url);
+    if (!allLinks) return;
+    for (let link of allLinks) {
+        await insert(link);
+    }
 }
 
-const rl = readline.createInterface({ input: stdin, output: stdout });
-
-async function startChat() {
-    rl.question("Prompt:> ", async function (prompt) {
-        if (prompt.toLowerCase() === "exit") {
+async function startTakingPrompt() {
+    rl.question("Prompt:=> ", async function (prompt) {
+        if (prompt.toLocaleLowerCase() == "exit") {
             rl.close();
             return;
         }
-        await chat(prompt);
-        startChat()
+
+        const questionEmbedding = await generateVectorEmbeddingsOfData({ text: prompt });
+
+        const collection = await chromaClient.getOrCreateCollection({
+            name: WEB_COLLECTION
+        });
+
+        const collectionResult = await collection.query({
+            nResults: 3,
+            queryEmbeddings: questionEmbedding
+        });
+
+        const head = collectionResult.metadatas[0].map((e: Metadata | any) => e.head).filter((e) => e.trim() !== "" && !!e);
+
+        const body = collectionResult.metadatas[0].map((e: Metadata | any) => e.body).filter((e) => e.trim() !== "" && !!e);
+
+        const url = collectionResult.metadatas[0].map((e: Metadata | any) => e.url).filter((e) => e.trim() !== "" && !!e);
+
+        const chat = chatModel.startChat({
+            history: [
+                {
+                    role: "user",
+                    parts: [{
+                        text: `
+                            {
+                        URLs: ${url},
+                        head: ${head},
+                        body: ${body}
+                        }
+                        `}]
+                },
+                {
+                    role: "model",
+                    parts: [{ text: "You are an AI support agent expect in providing support to user on behalf of a webpage. Given the context about page content, reply the user accordingly" }]
+                },
+            ]
+        })
+
+        const result = await chat.sendMessage(prompt);
+
+        console.log(`🤖: ${result.response.text()},
+        urls: ${url[0]}`)
+        await startTakingPrompt();
     })
 }
 
-ingest("https://console.groq.com")
-startChat();
+async function chat(url = "") {
+    if (!url.startsWith("https://") || !url.startsWith("http://")) {
+        console.log("😵 Invalid URl...");
+        return;
+    }
+    //(Recommended)It's better if you will copy the link from browser then paste it here
+    console.log("🏃‍♂️‍➡️ Model training... start 👍");
+    await startDataFeeding(url);
+    console.log("🏆 Model trained successfully... 💨");
 
+    await startTakingPrompt();
+};
+
+//(Recommended)It's better if you will copy the link from browser and then paste it here
+chat("website URL(uniform resource locator")
